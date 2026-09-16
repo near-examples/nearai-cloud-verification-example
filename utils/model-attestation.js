@@ -1,38 +1,44 @@
 #!/usr/bin/env node
-import { decodeJwt } from "jose";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { NVIDIA_NRAS_ISSUER, NVIDIA_NRAS_JWKS_URL } from "./api.js";
+
+const nvidiaKeys = createRemoteJWKSet(new URL(NVIDIA_NRAS_JWKS_URL));
 
 /**
- * Decode NVIDIA NRAS attestation response format
+ * Verify and decode the NVIDIA NRAS attestation response.
+ * Each token's signature is checked against NVIDIA's published keys (and its
+ * issuer), so the verdict can't be forged by whoever relays the response.
  * @param {Array} nvidiaResponse - Array response from NVIDIA: [["JWT", token], {"GPU-0": token, ...}]
- * @returns {Object} Decoded claims keyed by "JWT" (overall) and "GPU-n" (per GPU)
+ * @returns {Promise<Object>} Verified claims keyed by "JWT" (overall) and "GPU-n" (per GPU).
+ *   A token that fails verification is returned as `{ error }`.
  */
-export function decodeNvidiaAttestation(nvidiaResponse) {
+export async function decodeNvidiaAttestation(nvidiaResponse) {
   const result = {};
 
   if (!Array.isArray(nvidiaResponse)) {
     throw new Error("Expected array response from NVIDIA attestation service");
   }
 
-  const decodeToken = (key, token) => {
-    if (typeof token === "string" && token.includes(".")) {
-      try {
-        result[key] = decodeJwt(token);
-      } catch (error) {
-        console.warn(`Failed to decode ${key} token: ${error.message}`);
-        result[key] = { error: error.message };
-      }
-    }
-  };
-
+  const tokens = [];
   nvidiaResponse.forEach((item) => {
     if (Array.isArray(item)) {
       // ["JWT", "token_string"]
-      if (item.length === 2) decodeToken(item[0], item[1]);
+      if (item.length === 2) tokens.push([item[0], item[1]]);
     } else if (typeof item === "object" && item !== null) {
       // {"GPU-0": "token_string"}
-      Object.entries(item).forEach(([key, token]) => decodeToken(key, token));
+      tokens.push(...Object.entries(item));
     }
   });
+
+  for (const [key, token] of tokens) {
+    if (typeof token !== "string" || !token.includes(".")) continue;
+    try {
+      const { payload } = await jwtVerify(token, nvidiaKeys, { issuer: NVIDIA_NRAS_ISSUER });
+      result[key] = payload;
+    } catch (error) {
+      result[key] = { error: error.message };
+    }
+  }
 
   return result;
 }
@@ -41,7 +47,7 @@ export function decodeNvidiaAttestation(nvidiaResponse) {
  * Summarize a decoded NVIDIA attestation into the checks we care about.
  * @param {Object} decoded - Output of decodeNvidiaAttestation
  * @param {string} [expectedNonce] - The nonce sent with the attestation request
- * @returns {{overallResult: boolean, eatNonce: string|null, nonceMatch: boolean|null, gpus: Array}}
+ * @returns {{tokenVerified: boolean, overallResult: boolean, eatNonce: string|null, nonceMatch: boolean|null, gpus: Array}}
  */
 export function summarizeGpuAttestation(decoded, expectedNonce) {
   const overall = decoded.JWT || {};
@@ -65,7 +71,8 @@ export function summarizeGpuAttestation(decoded, expectedNonce) {
     }));
 
   return {
-    overallResult: overall["x-nvidia-overall-att-result"] === true,
+    tokenVerified: Boolean(decoded.JWT) && !overall.error,
+    overallResult: !overall.error && overall["x-nvidia-overall-att-result"] === true,
     eatNonce,
     nonceMatch,
     gpus,

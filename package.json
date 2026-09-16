@@ -1,6 +1,6 @@
 {
   "name": "nearai-confidential-cloud-examples",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Examples for working with NEAR AI Confidential Cloud attestation",
   "main": "app.js",
   "type": "module",
@@ -13,6 +13,7 @@
     "dev": "node --watch app.js"
   },
   "dependencies": {
+    "@phala/dcap-qvl": "0.6.3",
     "chalk": "^6.0.0",
     "dotenv": "^17.4.2",
     "ethers": "^6.15.0",

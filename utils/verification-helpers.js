@@ -56,6 +56,26 @@ async function verifySignature(message, signature, expectedAddresses) {
 }
 
 /**
+ * Split a signed `text` into its parts. Hashes never contain ':', so they are
+ * split off the right; a model id may contain ':'.
+ * @param {string} signatureText
+ * @returns {string[]} `[model_id, request_hash, response_hash]` or `[request_hash, response_hash]`
+ */
+function splitSignedText(signatureText) {
+  const lastColon = signatureText.lastIndexOf(":");
+  if (lastColon < 0) return [signatureText];
+  const middleColon = signatureText.lastIndexOf(":", lastColon - 1);
+  if (middleColon < 0) {
+    return [signatureText.slice(0, lastColon), signatureText.slice(lastColon + 1)];
+  }
+  return [
+    signatureText.slice(0, middleColon),
+    signatureText.slice(middleColon + 1, lastColon),
+    signatureText.slice(lastColon + 1),
+  ];
+}
+
+/**
  * Validate request/response hashes against the signed `text` payload.
  *
  * The signed text has one of two formats, depending on `signature_kind`:
@@ -75,7 +95,7 @@ function compareHashes(
   expectedModelId
 ) {
   try {
-    const parts = signatureText.split(":");
+    const parts = splitSignedText(signatureText);
 
     if (parts.length !== 2 && parts.length !== 3) {
       return {
@@ -122,4 +142,4 @@ function compareHashes(
   }
 }
 
-export { compareHashes, verifySignature, sha256sum, generateNonce };
+export { compareHashes, verifySignature, sha256sum, generateNonce, splitSignedText };

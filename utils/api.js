@@ -1,26 +1,29 @@
 #!/usr/bin/env node
 import dotenv from "dotenv";
+import { httpsRequest } from "./tls.js";
 
 dotenv.config({ quiet: true });
 
 export const NEARAI_BASE_URL =
   process.env.NEARAI_CLOUD_BASE_URL || "https://cloud-api.near.ai";
 export const NVIDIA_NRAS_URL = "https://nras.attestation.nvidia.com/v3/attest/gpu";
+export const NVIDIA_NRAS_JWKS_URL = "https://nras.attestation.nvidia.com/.well-known/jwks.json";
+export const NVIDIA_NRAS_ISSUER = "https://nras.attestation.nvidia.com";
 
 function authHeaders() {
   return { Authorization: `Bearer ${process.env.NEARAI_CLOUD_API_KEY}` };
 }
 
 /**
- * Build a descriptive error from a failed fetch Response (includes body snippet)
- * @param {Response} response
+ * Build a descriptive error from a failed response (includes body snippet)
+ * @param {Response|{status: number, statusText: string, text: string}} response
  * @param {string} context
  * @returns {Promise<Error>}
  */
 async function httpError(response, context) {
   let detail = "";
   try {
-    detail = (await response.text()).slice(0, 300);
+    detail = (typeof response.text === "string" ? response.text : await response.text()).slice(0, 300);
   } catch {
     // ignore body read errors
   }
@@ -57,10 +60,12 @@ function extractChatCompletionId(responseText) {
 /**
  * Send a Chat Message Request to NEAR AI Confidential Cloud
  * @param {string} requestBody - The exact JSON request body string to send (this exact string is hashed)
- * @returns {Promise<{response: Response, responseText: string, chatId: string|null}>}
+ * @param {{pinnedSpki?: string|null}} [options]
+ *   pinnedSpki: attested gateway TLS key; the request is refused before sending if the server presents another key
+ * @returns {Promise<{response: Object, responseText: string, chatId: string|null}>}
  */
-async function sendChatMessageRequest(requestBody) {
-  const response = await fetch(`${NEARAI_BASE_URL}/v1/chat/completions`, {
+async function sendChatMessageRequest(requestBody, options = {}) {
+  const response = await httpsRequest(`${NEARAI_BASE_URL}/v1/chat/completions`, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -68,14 +73,15 @@ async function sendChatMessageRequest(requestBody) {
       ...authHeaders(),
     },
     body: requestBody,
+    pinnedSpki: options.pinnedSpki,
   });
 
   if (!response.ok) {
     throw await httpError(response, "Chat completion request failed");
   }
 
-  // Read the exact bytes returned; this exact string is what gets hashed and signed
-  const responseText = await response.text();
+  // The exact bytes returned; this exact string is what gets hashed and signed
+  const responseText = response.text;
   const chatId = extractChatCompletionId(responseText);
 
   return { response, responseText, chatId };
@@ -90,24 +96,24 @@ async function sendChatMessageRequest(requestBody) {
  *
  * @param {string} chatId - The chat completion ID
  * @param {string} modelId - The model ID
- * @param {{signingAlgo?: string, retries?: number, retryDelayMs?: number}} [options]
+ * @param {{signingAlgo?: string, retries?: number, retryDelayMs?: number, pinnedSpki?: string|null}} [options]
  * @returns {Promise<{text: string, signature: string, signing_address: string, signing_algo: string, signature_kind?: string}>}
  */
 async function getChatMessageSignature(chatId, modelId, options = {}) {
-  const { signingAlgo = "ecdsa", retries = 5, retryDelayMs = 1000 } = options;
+  const { signingAlgo = "ecdsa", retries = 5, retryDelayMs = 1000, pinnedSpki = null } = options;
   const url =
     `${NEARAI_BASE_URL}/v1/signature/${encodeURIComponent(chatId)}` +
     `?model=${encodeURIComponent(modelId)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
 
   let lastError;
   for (let attempt = 1; attempt <= retries; attempt++) {
-    const response = await fetch(url, {
-      method: "GET",
+    const response = await httpsRequest(url, {
       headers: { accept: "application/json", ...authHeaders() },
+      pinnedSpki,
     });
 
     if (response.ok) {
-      return await response.json();
+      return JSON.parse(response.text);
     }
 
     lastError = await httpError(response, "Signature request failed");
@@ -125,18 +131,21 @@ async function getChatMessageSignature(chatId, modelId, options = {}) {
  * gateway attestation is returned.
  *
  * @param {string|null} modelName - Model to attest, or null for gateway-only
- * @param {{nonce?: string, signingAlgo?: string}} [options]
+ * @param {{nonce?: string, signingAlgo?: string, includeTlsFingerprint?: boolean}} [options]
  *   nonce: 64-char hex string (32 random bytes). Echoed back in `request_nonce`
  *          and bound into the NVIDIA payload / TDX report_data to prevent replay.
- * @returns {Promise<Object>} Attestation report
+ *   includeTlsFingerprint: ask the gateway to bind its TLS key into its TDX report_data.
+ * @returns {Promise<{report: Object, liveSpki: string}>} Attestation report, and the
+ *   SHA-256 SPKI fingerprint of the TLS key the report was fetched over
  */
 async function getModelAttestation(modelName, options = {}) {
-  const { nonce, signingAlgo = "ecdsa" } = options;
+  const { nonce, signingAlgo = "ecdsa", includeTlsFingerprint = true } = options;
   const params = new URLSearchParams({ signing_algo: signingAlgo });
   if (modelName) params.set("model", modelName);
   if (nonce) params.set("nonce", nonce);
+  if (includeTlsFingerprint) params.set("include_tls_fingerprint", "true");
 
-  const response = await fetch(
+  const response = await httpsRequest(
     `${NEARAI_BASE_URL}/v1/attestation/report?${params.toString()}`,
     { headers: { accept: "application/json", ...authHeaders() } }
   );
@@ -145,7 +154,7 @@ async function getModelAttestation(modelName, options = {}) {
     throw await httpError(response, "Attestation request failed");
   }
 
-  return await response.json();
+  return { report: JSON.parse(response.text), liveSpki: response.spki };
 }
 
 /**

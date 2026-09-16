@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { sendChatMessageRequest, getChatMessageSignature } from "./api.js";
-import { sha256sum, compareHashes, verifySignature } from "./verification-helpers.js";
+import { sha256sum, compareHashes, verifySignature, splitSignedText } from "./verification-helpers.js";
 
 /**
  * Work out which key signed the response.
@@ -12,7 +12,7 @@ function resolveSignatureKind(signature) {
   if (signature.signature_kind === "provider_tee" || signature.signature_kind === "gateway") {
     return signature.signature_kind;
   }
-  return signature.text.split(":").length === 3 ? "provider_tee" : "gateway";
+  return splitSignedText(signature.text).length === 3 ? "provider_tee" : "gateway";
 }
 
 /**
@@ -22,13 +22,14 @@ function resolveSignatureKind(signature) {
  * @param {string} modelId - Model to query
  * @param {{modelTee: string[], gateway: string[]}|string[]} expectedAddresses
  *   Signing addresses from the attestation report. A plain array is treated as model TEE addresses.
- * @param {{stream?: boolean}} [options]
+ * @param {{stream?: boolean, pinnedSpki?: string|null}} [options]
  *   stream: whether to stream the response. The gateway signs (`gateway`) whenever it
  *           returns bytes the model TEE did not sign byte-for-byte (e.g. rewritten
  *           streams); otherwise the model TEE's signature is passed through (`provider_tee`).
+ *   pinnedSpki: attested gateway TLS key. Requests are refused unless the server presents it.
  */
 async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses, options = {}) {
-  const { stream = false } = options;
+  const { stream = false, pinnedSpki = null } = options;
 
   const addresses = Array.isArray(expectedAddresses)
     ? { modelTee: expectedAddresses, gateway: [] }
@@ -43,7 +44,7 @@ async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses,
 
   try {
     // Step 1: Send chat message request
-    const response = await sendChatMessageRequest(requestBody);
+    const response = await sendChatMessageRequest(requestBody, { pinnedSpki });
     if (!response.chatId) {
       throw new Error("Could not extract chat completion id from response");
     }
@@ -53,7 +54,7 @@ async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses,
     const responseHash = sha256sum(response.responseText);
 
     // Step 3: Fetch the signature for this chat id
-    const signature = await getChatMessageSignature(response.chatId, modelId);
+    const signature = await getChatMessageSignature(response.chatId, modelId, { pinnedSpki });
     const signatureKind = resolveSignatureKind(signature);
 
     // Step 4: Validate hashes (and model id, when the model TEE signed)
@@ -61,7 +62,7 @@ async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses,
 
     // The declared kind must match the signed payload, so a server-supplied kind
     // can't route a model-less payload to the model TEE check or vice versa
-    const signedPartCount = signature.text.split(":").length;
+    const signedPartCount = splitSignedText(signature.text).length;
     const signatureKindMatch = signedPartCount === (signatureKind === "provider_tee" ? 3 : 2);
     // A model TEE signature must commit to the model id we asked for
     if (signatureKind === "provider_tee" && hashValidation.valid && hashValidation.modelIdMatch !== true) {

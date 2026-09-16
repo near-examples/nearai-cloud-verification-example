@@ -13,6 +13,7 @@ import {
 } from "./utils/api.js";
 import { sendAndVerifyChatMessage } from "./utils/send-and-verify-chat.js";
 import { generateNonce } from "./utils/verification-helpers.js";
+import { verifyTdxAttestation } from "./utils/tdx-attestation.js";
 
 // You can change this to any TEE-hosted model you want to test
 // See available models at: https://docs.near.ai/cloud/models
@@ -30,14 +31,35 @@ function check(name, pass) {
   return pass;
 }
 
+function printSummary() {
+  const failed = checks.filter((c) => !c.pass);
+  log(chalk.bold("\n\n📋 Summary"));
+  log("--------------------------------");
+  for (const c of checks) log(`   ${ok(c.pass)} ${c.name}`);
+  return failed.length;
+}
+
+function logTdx(label, tdx) {
+  log(`       ${label}:`);
+  log(`         ${ok(tdx.quoteValid)} Intel TDX quote verified against Intel's root of trust (non-debug TD)`);
+  if (tdx.tcbStatus) {
+    const advisories = tdx.advisoryIds.length ? chalk.dim(` (advisories: ${tdx.advisoryIds.join(", ")})`) : "";
+    log(`         ${ok(tdx.tcbAccepted)} Platform TCB status: ${tdx.tcbStatus}${advisories}`);
+  }
+  log(`         ${ok(tdx.bindsSigningKey)} report_data binds the signing address${tdx.tlsBound ? " + TLS key" : ""}`);
+  log(`         ${ok(tdx.bindsNonce)} report_data binds our nonce`);
+  if (tdx.error) log(`         ${chalk.red(tdx.error)}`);
+}
+
 async function main() {
   try {
     log(chalk.bold("\n\n🚀 Starting NEAR AI Cloud Verification Demo"));
     log(`   API Key configured: ${process.env.NEARAI_CLOUD_API_KEY ? chalk.bold.green("Yes") : chalk.bold.red("No")}`);
     log("===============================================");
     log(chalk.dim("  - Get an attestation report (gateway + model TEEs) from NEAR AI Confidential Cloud"));
-    log(chalk.dim("  - Verify the GPU attestation w/ NVIDIA's attestation service (incl. nonce freshness)"));
-    log(chalk.dim("  - Send a Chat Message Request to NEAR AI Confidential Cloud"));
+    log(chalk.dim("  - Verify the Intel TDX quotes and what they bind (signing keys, nonce, gateway TLS key)"));
+    log(chalk.dim("  - Verify the GPU attestation w/ NVIDIA's attestation service (signed token, nonce freshness)"));
+    log(chalk.dim("  - Only if everything passed: send a Chat Message Request over the attested TLS key"));
     log(chalk.dim("  - Verify the response hashes and TEE signature\n\n"));
 
     // ------------------------------------------------------------------
@@ -50,7 +72,7 @@ async function main() {
     log(`   AI Model:        ${chalk.cyan(MODEL_NAME)}`);
     log(`   Request Nonce:   ${chalk.dim(nonce)}`);
 
-    const attestationReport = await getModelAttestation(MODEL_NAME, { nonce });
+    const { report: attestationReport, liveSpki } = await getModelAttestation(MODEL_NAME, { nonce });
     const signingAddresses = extractSigningAddresses(attestationReport);
     const modelAttestations = attestationReport.model_attestations ?? [];
 
@@ -68,14 +90,52 @@ async function main() {
     check("Attestation nonce echoed (model TEEs)", modelNoncesOk);
 
     // ------------------------------------------------------------------
-    // Step 2: Verify GPU attestation with NVIDIA
+    // Step 2: Verify Intel TDX quotes (gateway + every model TEE node)
+    // ------------------------------------------------------------------
+    // Until this passes, the signing addresses and echoed nonces above are only
+    // values the server reports about itself.
+    log(chalk.bold("\n\n2) Verifying Intel TDX quotes:"));
+    log("--------------------------------");
+    log(`🌐 Intel collateral: ${chalk.bold.blue("https://api.trustedservices.intel.com")}\n`);
+
+    const gateway = attestationReport.gateway_attestation;
+    let gatewayTlsBound = false;
+    if (gateway) {
+      const gatewayTdx = await verifyTdxAttestation(gateway, nonce);
+      logTdx(`Gateway TEE ${chalk.yellow(gateway.signing_address)}`, gatewayTdx);
+      // The gateway TLS key is inside its hardware-signed report_data; the
+      // connection we fetched the report over must present that same key.
+      gatewayTlsBound =
+        gatewayTdx.passed &&
+        gatewayTdx.tlsBound &&
+        String(gateway.tls_cert_fingerprint).toLowerCase() === liveSpki;
+      log(`         ${ok(gatewayTlsBound)} This connection's TLS key is the attested gateway key (TLS ends inside the TEE)`);
+      log(chalk.dim(`           live ${liveSpki} / attested ${gateway.tls_cert_fingerprint ?? "(not provided)"}`));
+      check("Gateway Intel TDX quote verified (signing key + nonce bound)", gatewayTdx.passed);
+    } else {
+      log("   ❌ No gateway attestation in report");
+      check("Gateway Intel TDX quote verified (signing key + nonce bound)", false);
+    }
+    check("Gateway TLS key bound to its quote and matches this connection", gatewayTlsBound);
+
+    let allModelsPassed = modelAttestations.length > 0;
+    for (let i = 0; i < modelAttestations.length; i++) {
+      const attestation = modelAttestations[i];
+      const tdx = await verifyTdxAttestation(attestation, nonce);
+      logTdx(`Model TEE ${i + 1}/${modelAttestations.length} ${chalk.yellow(attestation.signing_address)}`, tdx);
+      allModelsPassed &&= tdx.passed;
+    }
+    check("Model Intel TDX quotes verified (all TEE nodes, signing keys + nonce bound)", allModelsPassed);
+
+    // ------------------------------------------------------------------
+    // Step 3: Verify GPU attestation with NVIDIA
     // ------------------------------------------------------------------
     const nvidiaPayloads = modelAttestations
       .filter((a) => a.nvidia_payload)
       .map((a) => ({ signingAddress: a.signing_address, payload: a.nvidia_payload }));
 
     if (nvidiaPayloads.length > 0) {
-      log(chalk.bold("\n\n2) Verifying GPU attestation with NVIDIA:"));
+      log(chalk.bold("\n\n3) Verifying GPU attestation with NVIDIA:"));
       log("--------------------------------");
       log(`🌐 NVIDIA Attestation Endpoint: ${chalk.bold.blue(NVIDIA_NRAS_URL)}`);
       log(`📊 Found ${nvidiaPayloads.length} NVIDIA payload(s) to verify \n`);
@@ -96,11 +156,13 @@ async function main() {
         }
 
         const gpuVerification = await getGpuAttestation(payload);
-        const summary = summarizeGpuAttestation(decodeNvidiaAttestation(gpuVerification), nonce);
-        const passed = summary.overallResult && summary.nonceMatch === true && payloadNonceOk;
+        const summary = summarizeGpuAttestation(await decodeNvidiaAttestation(gpuVerification), nonce);
+        const passed =
+          summary.tokenVerified && summary.overallResult && summary.nonceMatch === true && payloadNonceOk;
         allPassed &&= passed;
 
         log(`       Payload ${i + 1}/${nvidiaPayloads.length} (TEE ${chalk.yellow(signingAddress)}):`);
+        log(`         ${ok(summary.tokenVerified)} NVIDIA token signature verified against NVIDIA's published keys`);
         log(`         ${ok(summary.overallResult)} NVIDIA overall attestation result`);
         log(`         ${ok(payloadNonceOk)} Payload nonce matches request nonce`);
         log(`         ${ok(summary.nonceMatch)} NVIDIA token eat_nonce matches request nonce`);
@@ -119,17 +181,30 @@ async function main() {
       check("NVIDIA GPU attestation (all TEE nodes)", false);
     }
 
+    // Never send a prompt to an enclave that failed verification
+    if (checks.some((c) => !c.pass)) {
+      const failedCount = printSummary();
+      log(chalk.bold.red(`\n❌  ${failedCount} attestation check(s) failed: not sending the chat message.`));
+      process.exit(1);
+    }
+
     // ------------------------------------------------------------------
-    // Step 3: Send and verify chat message
+    // Step 4: Send and verify chat message
     // ------------------------------------------------------------------
-    log(chalk.bold("\n\n3) Sending and verifying chat message..."));
+    log(chalk.bold("\n\n4) Sending and verifying chat message..."));
     log("--------------------------------");
     log(`🌐 NEAR AI Cloud Endpoint: ${chalk.bold.blue(`${NEARAI_BASE_URL}/v1/chat/completions`)}`);
     log(`   TEE AI Model:     ${chalk.cyan(MODEL_NAME)}`);
     log(`   Chat Msg Sent:    ${chalk.cyan(CHAT_CONTENT)}`);
     log(`   Streaming:        ${chalk.cyan(String(STREAM))}`);
+    log(`   Pinned TLS key:   ${chalk.dim(liveSpki)}`);
 
-    const chatResult = await sendAndVerifyChatMessage(CHAT_CONTENT, MODEL_NAME, signingAddresses, { stream: STREAM });
+    // Pinned to the attested gateway TLS key: the request is refused before
+    // anything is sent if a different server answers.
+    const chatResult = await sendAndVerifyChatMessage(CHAT_CONTENT, MODEL_NAME, signingAddresses, {
+      stream: STREAM,
+      pinnedSpki: liveSpki,
+    });
     const { hashValidation, signatureValidation, signatureKind, signatureKindMatch } = chatResult;
 
     log(`   Returned Chat ID: ${chalk.cyan(chatResult.response.chatId)}`);
@@ -171,14 +246,11 @@ async function main() {
     // ------------------------------------------------------------------
     // Summary
     // ------------------------------------------------------------------
-    const failed = checks.filter((c) => !c.pass);
-    log(chalk.bold("\n\n📋 Summary"));
-    log("--------------------------------");
-    for (const c of checks) log(`   ${ok(c.pass)} ${c.name}`);
-    if (failed.length === 0) {
+    const failedCount = printSummary();
+    if (failedCount === 0) {
       log(chalk.bold.green("\n✅  Verification Demo complete: all checks passed!"));
     } else {
-      log(chalk.bold.red(`\n❌  Verification Demo complete: ${failed.length} check(s) failed`));
+      log(chalk.bold.red(`\n❌  Verification Demo complete: ${failedCount} check(s) failed`));
       process.exit(1);
     }
   } catch (error) {

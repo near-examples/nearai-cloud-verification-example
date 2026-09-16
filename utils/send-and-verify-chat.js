@@ -23,9 +23,9 @@ function resolveSignatureKind(signature) {
  * @param {{modelTee: string[], gateway: string[]}|string[]} expectedAddresses
  *   Signing addresses from the attestation report. A plain array is treated as model TEE addresses.
  * @param {{stream?: boolean}} [options]
- *   stream: false -> response is signed inside the model TEE (`provider_tee`)
- *           true  -> the gateway rewrites stream bytes (usage accounting), so it signs
- *                    the exact bytes you receive with the gateway TEE key (`gateway`)
+ *   stream: whether to stream the response. The gateway signs (`gateway`) whenever it
+ *           returns bytes the model TEE did not sign byte-for-byte (e.g. rewritten
+ *           streams); otherwise the model TEE's signature is passed through (`provider_tee`).
  */
 async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses, options = {}) {
   const { stream = false } = options;
@@ -59,6 +59,16 @@ async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses,
     // Step 4: Validate hashes (and model id, when the model TEE signed)
     const hashValidation = compareHashes(signature.text, requestHash, responseHash, modelId);
 
+    // The declared kind must match the signed payload, so a server-supplied kind
+    // can't route a model-less payload to the model TEE check or vice versa
+    const signedPartCount = signature.text.split(":").length;
+    const signatureKindMatch = signedPartCount === (signatureKind === "provider_tee" ? 3 : 2);
+    // A model TEE signature must commit to the model id we asked for
+    if (signatureKind === "provider_tee" && hashValidation.valid && hashValidation.modelIdMatch !== true) {
+      hashValidation.valid = false;
+      hashValidation.error = "Model TEE signature must include the requested model id";
+    }
+
     // Step 5: Verify the signature against the key that is supposed to have signed
     const expectedForKind =
       signatureKind === "gateway" ? addresses.gateway : addresses.modelTee;
@@ -78,6 +88,7 @@ async function sendAndVerifyChatMessage(chatContent, modelId, expectedAddresses,
       responseHash,
       signature,
       signatureKind,
+      signatureKindMatch,
       hashValidation,
       signatureValidation,
     };

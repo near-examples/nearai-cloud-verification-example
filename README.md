@@ -1,7 +1,7 @@
 # NEAR AI Cloud Verification Example
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-22%2B-green.svg)](https://nodejs.org/)
 [![NEAR AI Docs](https://img.shields.io/badge/NEAR_AI-Docs-blue.svg)](https://docs.near.ai/)
 
 > 🚀 **Learn how to build secure, verifiable AI applications using NEAR AI Confidential Cloud**
@@ -18,7 +18,7 @@ This repository demonstrates how to interact with NEAR AI's Cloud platform, veri
 
 ## 📋 Prerequisites
 
-- **Node.js 20+** and **npm/pnpm**
+- **Node.js 22+** and **npm/pnpm**
 - **NEAR AI Cloud API Key** ([Get yours here](https://cloud.near.ai/))
 - Basic understanding of:
   - Trusted Execution Environments (TEEs)
@@ -47,8 +47,8 @@ NEARAI_CLOUD_API_KEY=your_api_key_here
 ### 3. Run the Demo
 
 ```bash
-pnpm start         # non-streaming: response signed by the model TEE
-pnpm start:stream  # streaming:     response signed by the gateway TEE
+pnpm start         # non-streaming chat request
+pnpm start:stream  # streaming chat request (always signed by the gateway TEE)
 ```
 
 The process exits with code `1` if any verification check fails.
@@ -86,10 +86,10 @@ The signature endpoint returns a `signature_kind` field that tells you **which T
 
 | `signature_kind` | Who signs | Signed `text` | When |
 |------------------|-----------|---------------|------|
-| `provider_tee` | The **model TEE** that served your request | `{model_id}:{request_hash}:{response_hash}` | Non-streaming requests (default in this demo) |
-| `gateway` | The **gateway TEE** (`cloud-api.near.ai`) | `{request_hash}:{response_hash}` | Streaming requests — the gateway rewrites stream chunks for OpenAI-compatible usage accounting, so it signs the exact bytes you receive |
+| `provider_tee` | The **model TEE** that served your request | `{model_id}:{request_hash}:{response_hash}` | Model signatures passed through by the gateway, and all direct completions endpoint responses |
+| `gateway` | The **gateway TEE** (`cloud-api.near.ai`) | `{request_hash}:{response_hash}` | Whenever the gateway returns bytes the model TEE did not sign byte-for-byte (e.g. streams rewritten for OpenAI-compatible usage accounting) — it signs the exact bytes you receive. Non-streaming requests through `cloud-api.near.ai` can get this kind too |
 
-The demo checks `signature_kind` and verifies the recovered signer against the matching address from the attestation report: `model_attestations[].signing_address` for `provider_tee`, or `gateway_attestation.signing_address` for `gateway`.
+The demo checks that `signature_kind` matches the format of `text` (a model TEE signature must include the requested model ID), then verifies the recovered signer against the matching address from the attestation report: `model_attestations[].signing_address` for `provider_tee`, or `gateway_attestation.signing_address` for `gateway`.
 
 > Older signatures may omit `signature_kind`; the demo falls back to inferring it from the number of `:`-separated parts in `text`.
 
@@ -183,7 +183,7 @@ When you see ✅ for all checks, you have cryptographic proof that:
 
 - **🏗️ Trusted Hardware**: The AI model runs in a verified NVIDIA GPU TEE, attested freshly (nonce-bound)
 - **🔐 Data Integrity**: Request and response haven't been tampered with
-- **✍️ Authenticity**: Response was signed by the attested model TEE (or gateway TEE for streamed responses)
+- **✍️ Authenticity**: Response was signed by the attested model TEE or by the attested gateway TEE, as reported by `signature_kind`
 - **🛡️ End-to-End Security**: Complete chain of trust established
 
 This demo intentionally stops short of a full verifier. For Intel TDX quote verification (`dcap-qvl`), TDX `report_data` binding, Docker compose / `mr_config` checks, TLS attestation and Sigstore provenance, see the [NEAR AI Cloud Verifier](https://github.com/nearai/nearai-cloud-verifier).

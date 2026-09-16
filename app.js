@@ -89,7 +89,8 @@ async function main() {
         // The payload NEAR AI hands us must carry the nonce we asked for
         let payloadNonceOk = false;
         try {
-          payloadNonceOk = JSON.parse(payload).nonce?.toLowerCase() === nonce;
+          const parsed = typeof payload === "string" ? JSON.parse(payload) : payload;
+          payloadNonceOk = parsed?.nonce?.toLowerCase() === nonce;
         } catch {
           payloadNonceOk = false;
         }
@@ -129,7 +130,7 @@ async function main() {
     log(`   Streaming:        ${chalk.cyan(String(STREAM))}`);
 
     const chatResult = await sendAndVerifyChatMessage(CHAT_CONTENT, MODEL_NAME, signingAddresses, { stream: STREAM });
-    const { hashValidation, signatureValidation, signatureKind } = chatResult;
+    const { hashValidation, signatureValidation, signatureKind, signatureKindMatch } = chatResult;
 
     log(`   Returned Chat ID: ${chalk.cyan(chatResult.response.chatId)}`);
     log(`   Signature Kind:   ${chalk.cyan(signatureKind)} ${chalk.dim(
@@ -137,6 +138,8 @@ async function main() {
         ? "(gateway TEE signed the exact bytes you received)"
         : "(model TEE signed the request/response it processed)"
     )}`);
+    log(`   ${ok(signatureKindMatch)} Signature kind matches signed payload format`);
+    check("Signature kind matches signed payload format", signatureKindMatch);
 
     log(`\n   ${chalk.bold(" 🔎 Checking if hash values match:")}`);
     log("       --------------------------------");

@@ -1,24 +1,20 @@
 #!/usr/bin/env node
-import dotenv from "dotenv";
 import { decodeJwt } from "jose";
 
-dotenv.config();
-
 /**
- * Decode NVIDIA attestation response format
- * @param {Array} nvidiaResponse - Array response from NVIDIA containing JWT tokens
- * @returns {Object} Decoded attestation data with JWT and GPU tokens
+ * Decode NVIDIA NRAS attestation response format
+ * @param {Array} nvidiaResponse - Array response from NVIDIA: [["JWT", token], {"GPU-0": token, ...}]
+ * @returns {Object} Decoded claims keyed by "JWT" (overall) and "GPU-n" (per GPU)
  */
 export function decodeNvidiaAttestation(nvidiaResponse) {
   const result = {};
 
   if (!Array.isArray(nvidiaResponse)) {
-    throw new Error('Expected array response from NVIDIA attestation service');
+    throw new Error("Expected array response from NVIDIA attestation service");
   }
 
-  // Helper function to decode a token and handle errors
   const decodeToken = (key, token) => {
-    if (typeof token === 'string' && token.includes('.')) {
+    if (typeof token === "string" && token.includes(".")) {
       try {
         result[key] = decodeJwt(token);
       } catch (error) {
@@ -30,15 +26,11 @@ export function decodeNvidiaAttestation(nvidiaResponse) {
 
   nvidiaResponse.forEach((item) => {
     if (Array.isArray(item)) {
-      // Handle ["JWT", "token_string"] format
-      if (item.length === 2) {
-        decodeToken(item[0], item[1]);
-      }
-    } else if (typeof item === 'object' && item !== null) {
-      // Handle {"GPU-0": "token_string"} format
-      Object.entries(item).forEach(([key, token]) => {
-        decodeToken(key, token);
-      });
+      // ["JWT", "token_string"]
+      if (item.length === 2) decodeToken(item[0], item[1]);
+    } else if (typeof item === "object" && item !== null) {
+      // {"GPU-0": "token_string"}
+      Object.entries(item).forEach(([key, token]) => decodeToken(key, token));
     }
   });
 
@@ -46,59 +38,59 @@ export function decodeNvidiaAttestation(nvidiaResponse) {
 }
 
 /**
- * Decode Intel quote hex string to structured data
- * @param {string} hexQuote - Hex-encoded Intel quote
- * @returns {Object} Decoded quote structure with header, body, and signature info
+ * Summarize a decoded NVIDIA attestation into the checks we care about.
+ * @param {Object} decoded - Output of decodeNvidiaAttestation
+ * @param {string} [expectedNonce] - The nonce sent with the attestation request
+ * @returns {{overallResult: boolean, eatNonce: string|null, nonceMatch: boolean|null, gpus: Array}}
  */
-function decodeIntelQuote(hexQuote) {
-  try {
-    if (!hexQuote || typeof hexQuote !== 'string') {
-      return { error: 'Invalid hex quote format' };
-    }
+export function summarizeGpuAttestation(decoded, expectedNonce) {
+  const overall = decoded.JWT || {};
+  const eatNonce = overall.eat_nonce ?? null;
+  const nonceMatch =
+    expectedNonce && eatNonce
+      ? eatNonce.toLowerCase() === expectedNonce.toLowerCase()
+      : null;
 
-    // Convert hex to bytes for analysis
-    const bytes = new Uint8Array(hexQuote.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    
-    if (bytes.length < 48) {
-      return { error: 'Quote too short to be valid' };
-    }
+  const gpus = Object.entries(decoded)
+    .filter(([key]) => key.startsWith("GPU-"))
+    .map(([key, claims]) => ({
+      key,
+      hwmodel: claims.hwmodel ?? null,
+      driverVersion: claims["x-nvidia-gpu-driver-version"] ?? null,
+      vbiosVersion: claims["x-nvidia-gpu-vbios-version"] ?? null,
+      secureBoot: claims.secboot ?? null,
+      debugStatus: claims.dbgstat ?? null,
+      nonceMatch: claims["x-nvidia-gpu-attestation-report-nonce-match"] ?? null,
+      measurementResult: claims.measres ?? null,
+    }));
 
-    // Basic SGX quote structure parsing
-    const quote = {
-      version: bytes[0] | (bytes[1] << 8),
-      sign_type: bytes[2] | (bytes[3] << 8),
-      epid_group_id: Array.from(bytes.slice(4, 8)).map(b => b.toString(16).padStart(2, '0')).join(''),
-      qe_svn: bytes[8] | (bytes[9] << 8),
-      pce_svn: bytes[10] | (bytes[11] << 8),
-      xeid: Array.from(bytes.slice(12, 28)).map(b => b.toString(16).padStart(2, '0')).join(''),
-      basename: Array.from(bytes.slice(28, 60)).map(b => b.toString(16).padStart(2, '0')).join(''),
-      raw_hex: hexQuote,
-      size_bytes: bytes.length
-    };
+  return {
+    overallResult: overall["x-nvidia-overall-att-result"] === true,
+    eatNonce,
+    nonceMatch,
+    gpus,
+  };
+}
 
-    // Add report body if quote is long enough
-    if (bytes.length >= 432) {
-      const reportBody = bytes.slice(48, 432);
-      quote.report_body = {
-        cpu_svn: Array.from(reportBody.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        misc_select: Array.from(reportBody.slice(16, 20)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        attributes: Array.from(reportBody.slice(32, 48)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        mr_enclave: Array.from(reportBody.slice(64, 96)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        mr_signer: Array.from(reportBody.slice(128, 160)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        config_id: Array.from(reportBody.slice(160, 224)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        isv_prod_id: reportBody[256] | (reportBody[257] << 8),
-        isv_svn: reportBody[258] | (reportBody[259] << 8),
-        config_svn: reportBody[260] | (reportBody[261] << 8),
-        isv_family_id: Array.from(reportBody.slice(304, 320)).map(b => b.toString(16).padStart(2, '0')).join(''),
-        report_data: Array.from(reportBody.slice(320, 384)).map(b => b.toString(16).padStart(2, '0')).join('')
-      };
-    }
-
-    return quote;
-  } catch (error) {
-    return { 
-      error: `Failed to decode Intel quote: ${error.message}`,
-      raw_hex: hexQuote
-    };
+/**
+ * Pull the signing addresses out of an attestation report.
+ *
+ * - `modelTee`: one address per TEE node serving the model (signs `provider_tee` chat signatures)
+ * - `gateway`:  the cloud-api gateway TEE address (signs `gateway` chat signatures)
+ *
+ * @param {Object} attestationReport - Response from /v1/attestation/report
+ * @returns {{modelTee: string[], gateway: string[]}}
+ */
+export function extractSigningAddresses(attestationReport) {
+  const modelTee = [];
+  for (const attestation of attestationReport.model_attestations ?? []) {
+    const addr = attestation.signing_address;
+    if (addr && !modelTee.includes(addr)) modelTee.push(addr);
   }
+
+  const gateway = [];
+  const gatewayAddr = attestationReport.gateway_attestation?.signing_address;
+  if (gatewayAddr) gateway.push(gatewayAddr);
+
+  return { modelTee, gateway };
 }

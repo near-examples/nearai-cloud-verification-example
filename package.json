@@ -1,19 +1,22 @@
 {
   "name": "nearai-confidential-cloud-examples",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Examples for working with NEAR AI Confidential Cloud attestation",
   "main": "app.js",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node app.js",
+    "start:stream": "STREAM=true node app.js",
     "dev": "node --watch app.js"
   },
   "dependencies": {
-    "chalk": "^5.6.0",
-    "dotenv": "^16.3.1",
+    "chalk": "^6.0.0",
+    "dotenv": "^17.4.2",
     "ethers": "^6.15.0",
-    "jose": "^6.1.0",
-    "js-sha256": "^0.11.1"
+    "jose": "^6.1.0"
   },
   "keywords": [
     "nearai",
